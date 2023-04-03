@@ -1,0 +1,9 @@
+Language: Cpp
+BasedOnStyle: LLVM
+UseTab: Never
+IndentWidth: 4
+ColumnLimit: 100
+AllowShortFunctionsOnASingleLine: Empty
+IndentAccessModifiers: true
+AlwaysBreakTemplateDeclarations: Yes
+BreakStringLiterals: False
