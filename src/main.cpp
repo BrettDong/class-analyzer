@@ -14,72 +14,88 @@ using namespace clang::tooling;
 using namespace llvm;
 
 static llvm::cl::OptionCategory ClassAnalyzerCategory("Class Analyzer Options");
-static cl::extrahelp CommonHelp(CommonOptionsParser::HelpMessage);
+[[maybe_unused]] static cl::extrahelp CommonHelp(CommonOptionsParser::HelpMessage);
 
-class ClassAnalyzerASTVisitor : public RecursiveASTVisitor<ClassAnalyzerASTVisitor> {
-    protected:
-        CompilerInstance &mCI;
-
+class ExtractFieldFrontendAction : public ASTFrontendAction {
     public:
-        explicit ClassAnalyzerASTVisitor(CompilerInstance &CI) : mCI(CI) {}
-
-        bool VisitCXXMethodDecl(CXXMethodDecl *Decl) {
-            const CXXRecordDecl *Parent = Decl->getParent();
-            if (Parent == nullptr) {
-                return true;
-            }
-            if (!Parent->getName().equals("Character")) {
-                return true;
-            }
-            llvm::outs() << Decl->getName() << '\n';
-            return true;
-        }
-};
-
-class ClassAnalyzerASTConsumer : public ASTConsumer {
-    protected:
-        CompilerInstance &mCI;
-        std::unique_ptr<ClassAnalyzerASTVisitor> mVisitor;
-
-    public:
-        explicit ClassAnalyzerASTConsumer(CompilerInstance &CI) : mCI(CI) {
-            mVisitor = std::make_unique<ClassAnalyzerASTVisitor>(mCI);
-        }
-
-        void HandleTranslationUnit(ASTContext &Context) override {
-            mVisitor->TraverseDecl(Context.getTranslationUnitDecl());
-        }
-};
-
-class ClassAnalyzerMethodMatchCallback : public MatchFinder::MatchCallback {
-    public:
-        void run(const MatchFinder::MatchResult &Result) override {
-            const auto *Method = Result.Nodes.getNodeAs<CXXMethodDecl>("method");
-            const auto *Parent = Result.Nodes.getNodeAs<CXXRecordDecl>("parent");
-            auto &DiagEng = Result.Context->getDiagnostics();
-            if (Parent->getName().equals("Character")) {
-                auto DiagID = DiagEng.getCustomDiagID(DiagnosticsEngine::Remark, "Class method %0");
-                auto DiagBuilder = DiagEng.Report(Method->getOuterLocStart(), DiagID);
-                DiagBuilder.AddString(Method->getName());
-                DiagBuilder.AddSourceRange(CharSourceRange::getCharRange(Method->getSourceRange()));
-            }
-        }
-};
-
-class ClassAnalyzerFrontendAction : public ASTFrontendAction {
-    public:
-        ClassAnalyzerFrontendAction() {}
+        explicit ExtractFieldFrontendAction(std::string ClassName)
+            : mClassName(std::move(ClassName)) {}
 
         auto CreateASTConsumer(CompilerInstance &CI, StringRef InFile)
             -> std::unique_ptr<ASTConsumer> override {
-            auto Matcher = cxxMethodDecl(hasParent(cxxRecordDecl().bind("parent"))).bind("method");
+            auto Matcher =
+                fieldDecl(hasParent(cxxRecordDecl(isClass(), hasName(mClassName)))).bind("field");
+            mMatchFinder.addMatcher(Matcher, &mCallback);
+            return mMatchFinder.newASTConsumer();
+        }
+
+    protected:
+        class Callback : public MatchFinder::MatchCallback {
+            public:
+                void run(const MatchFinder::MatchResult &Result) override {
+                    //
+                }
+        };
+
+        std::string mClassName;
+        MatchFinder mMatchFinder;
+        Callback mCallback;
+};
+
+class FieldUsageFrontendAction : public ASTFrontendAction {
+    public:
+        explicit FieldUsageFrontendAction(std::string ClassName)
+            : mClassName(std::move(ClassName)) {}
+
+        auto CreateASTConsumer(CompilerInstance &CI, StringRef InFile)
+            -> std::unique_ptr<ASTConsumer> override {
+            auto Matcher =
+                memberExpr(
+                    hasObjectExpression(hasType(pointsTo(cxxRecordDecl(hasName(mClassName))))),
+                    hasAncestor(cxxMethodDecl(ofClass(hasName(mClassName))).bind("method")))
+                    .bind("member");
             mMatchFinder.addMatcher(Matcher, &mCallback);
             return mMatchFinder.newASTConsumer();
         }
 
     private:
+        class Callback : public MatchFinder::MatchCallback {
+            public:
+                void run(const MatchFinder::MatchResult &Result) override {
+                    const auto *Method = Result.Nodes.getNodeAs<CXXMethodDecl>("method");
+                    const auto *Member = Result.Nodes.getNodeAs<MemberExpr>("member");
+                    if (Method == nullptr) {
+                        llvm::errs() << "Method is nullptr\n";
+                        return;
+                    }
+                    if (Member == nullptr) {
+                        llvm::errs() << "Member is nullptr\n";
+                        return;
+                    }
+                    if (Member->getMemberDecl()->isFunctionOrFunctionTemplate()) {
+                        return;
+                    }
+                    auto &DiagEng = Result.Context->getDiagnostics();
+                    auto DiagID = DiagEng.getCustomDiagID(DiagnosticsEngine::Remark,
+                                                          "Usage of field %0 in method %1");
+                    auto DiagBuilder = DiagEng.Report(Member->getMemberLoc(), DiagID);
+                    DiagBuilder.AddString(Member->getMemberDecl()->getName());
+                    DiagBuilder.AddString(Method->getName());
+                    DiagBuilder.AddSourceRange(
+                        CharSourceRange::getCharRange(Member->getMemberLoc()));
+                }
+        };
+
+        std::string mClassName;
         MatchFinder mMatchFinder;
-        ClassAnalyzerMethodMatchCallback mCallback;
+        Callback mCallback;
+};
+
+class FieldUsageFrontendActionFactory : public FrontendActionFactory {
+    public:
+        std::unique_ptr<FrontendAction> create() override {
+            return std::make_unique<FieldUsageFrontendAction>("Character");
+        }
 };
 
 int main(int argc, const char **argv) {
@@ -90,5 +106,6 @@ int main(int argc, const char **argv) {
     }
     CommonOptionsParser &OptionsParser = ExpectedParser.get();
     ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
-    return Tool.run(newFrontendActionFactory<ClassAnalyzerFrontendAction>().get());
+    auto FrontendActionFactory = std::make_unique<FieldUsageFrontendActionFactory>();
+    return Tool.run(FrontendActionFactory.get());
 }
